@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Dice Engine Pro</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400;0,14..32,600;0,14..32,700;0,14..32,800;0,14..32,900;1,14..32,400&display=swap" rel="stylesheet">
@@ -58,6 +58,7 @@
             border-radius: 100px;
             border: 1px solid var(--glass-border);
             display: flex; align-items: center; gap: 4px;
+            max-width: calc(100vw - 24px);
             pointer-events: auto;
             box-shadow:
                 0 0 0 1px rgba(0,0,0,0.6),
@@ -175,14 +176,16 @@
 
         /* ─── Result HUD ──────────────────────────── */
         .result-hud {
-            position: absolute; bottom: 44px;
+            position: absolute;
+            bottom: max(44px, env(safe-area-inset-bottom) + 28px);
+            left: 50%; transform: translate(-50%, 18px);
             text-align: center; pointer-events: none;
-            opacity: 0; transform: translateY(18px);
+            opacity: 0; width: max-content; max-width: calc(100vw - 40px);
             transition:
                 opacity   0.75s cubic-bezier(0.16, 1, 0.3, 1),
                 transform 0.75s cubic-bezier(0.16, 1, 0.3, 1);
         }
-        .result-hud.visible { opacity: 1; transform: translateY(0); }
+        .result-hud.visible { opacity: 1; transform: translate(-50%, 0); }
 
         .success-count {
             font-size: clamp(72px, 11vw, 110px);
@@ -228,7 +231,6 @@
             .rolling-pill    { margin-top: 12px; }
             #special-msg     { font-size: clamp(30px, 11vw, 64px); letter-spacing: -1px; }
             .success-count   { font-size: clamp(52px, 16vw, 90px); letter-spacing: -4px; }
-            .result-hud      { bottom: 22px; }
         }
 
         /* ─── Reduced motion ──────────────────────── */
@@ -322,6 +324,17 @@
         if (sides <= 10) return SHAPE.KITE;
         if (sides <= 12) return SHAPE.PENT;
         return SHAPE.TRI; // d20, d100
+    }
+
+    // Approximate collision sphere radius for each die type.
+    // Used for die-to-die collision detection (sphere-sphere).
+    function getDiceRadius(sides) {
+        if (sides <= 4)  return 1.50; // tetrahedron
+        if (sides <= 6)  return 1.55; // cube  (half-diagonal ≈ 1.91, shrunk for feel)
+        if (sides <= 8)  return 1.50; // octahedron
+        if (sides <= 10) return 1.55; // d10
+        if (sides <= 12) return 1.50; // dodecahedron
+        return 1.45;                  // icosahedron d20/d100
     }
 
     // Height of die center above the floor at rest (rotation 0,0,0)
@@ -885,6 +898,7 @@
                     y: (Math.random() - 0.5) * 0.42,
                     z: (Math.random() - 0.5) * 0.35,
                 },
+                radius:           getDiceRadius(sides),
                 bounces:          0,
                 snapping:         false,   // snapping to face-flat orientation
                 snapQuat:         null,    // target quaternion for snap
@@ -1007,6 +1021,73 @@
             d.mesh.rotation.y += d.rotationV.y;
             d.mesh.rotation.z += d.rotationV.z;
         });
+
+        // ── Dice-dice collision resolution ──────────────
+        // Sphere-sphere model: each die has a radius; overlapping pairs are
+        // pushed apart and their velocities are reflected along the contact normal.
+        // We run 2 iterations per frame so stacked dice resolve quickly.
+        for (let iter = 0; iter < 2; iter++) {
+            for (let a = 0; a < dice.length - 1; a++) {
+                for (let b = a + 1; b < dice.length; b++) {
+                    const da = dice[a], db = dice[b];
+                    const aActive = !da.isStopped && !da.snapping;
+                    const bActive = !db.isStopped && !db.snapping;
+                    if (!aActive && !bActive) continue;
+
+                    const pa = da.mesh.position, pb = db.mesh.position;
+                    const dx = pb.x - pa.x;
+                    const dy = pb.y - pa.y;
+                    const dz = pb.z - pa.z;
+                    const distSq = dx*dx + dy*dy + dz*dz;
+                    const minDist = da.radius + db.radius;
+                    if (distSq >= minDist * minDist || distSq < 0.0001) continue;
+
+                    const dist = Math.sqrt(distSq);
+                    const pen  = minDist - dist;
+                    const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+
+                    // ── Positional correction ──
+                    // Active dice are pushed apart; stopped dice act as fixed walls.
+                    if (aActive && bActive) {
+                        pa.x -= nx * pen * 0.5;  pa.y -= ny * pen * 0.5;  pa.z -= nz * pen * 0.5;
+                        pb.x += nx * pen * 0.5;  pb.y += ny * pen * 0.5;  pb.z += nz * pen * 0.5;
+                    } else if (aActive) {
+                        pa.x -= nx * pen;  pa.y -= ny * pen;  pa.z -= nz * pen;
+                    } else {
+                        pb.x += nx * pen;  pb.y += ny * pen;  pb.z += nz * pen;
+                    }
+
+                    // Never let dice fall through the floor during correction
+                    if (aActive) pa.y = Math.max(pa.y, da.targetY);
+                    if (bActive) pb.y = Math.max(pb.y, db.targetY);
+
+                    // ── Velocity impulse ──
+                    const restitution = 0.38;
+                    const vax = aActive ? da.lateralV.x : 0, vay = aActive ? da.velocity : 0, vaz = aActive ? da.lateralV.y : 0;
+                    const vbx = bActive ? db.lateralV.x : 0, vby = bActive ? db.velocity : 0, vbz = bActive ? db.lateralV.y : 0;
+                    const vRel = (vbx - vax)*nx + (vby - vay)*ny + (vbz - vaz)*nz;
+
+                    if (vRel < 0) { // only if approaching
+                        const imp = -vRel * restitution / (aActive && bActive ? 1 : 0.5);
+                        if (aActive) {
+                            da.lateralV.x -= imp * nx;
+                            da.velocity    -= imp * ny;
+                            da.lateralV.y  -= imp * nz;
+                            // Small extra spin on collision
+                            da.rotationV.x += (Math.random() - 0.5) * 0.10;
+                            da.rotationV.z += (Math.random() - 0.5) * 0.10;
+                        }
+                        if (bActive) {
+                            db.lateralV.x += imp * nx;
+                            db.velocity    += imp * ny;
+                            db.lateralV.y  += imp * nz;
+                            db.rotationV.x += (Math.random() - 0.5) * 0.10;
+                            db.rotationV.z += (Math.random() - 0.5) * 0.10;
+                        }
+                    }
+                }
+            }
+        }
 
         // Show result the moment every die has finished snapping flat
         if (pendingResult && dice.length > 0 && dice.every(d => d.isStopped)) {
